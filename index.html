@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Weather Gauge</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #0a2632; overflow: hidden;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+  #sea { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="sea"></canvas>
+<script>
+(() => {
+'use strict';
+
+// ---------------------------------------------------------------- helpers
+const TAU = Math.PI * 2, DEG = Math.PI / 180;
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+const wrap = a => { a = (a + Math.PI) % TAU; if (a < 0) a += TAU; return a - Math.PI; };
+const rand = (a, b) => a + Math.random() * (b - a);
+const gauss = () => { let u = 0, v = 0; while (u === 0) u = Math.random(); while (v === 0) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(TAU * v); };
+const hash = (i, j) => { const s = Math.sin(i * 12.9898 + j * 78.233) * 43758.5453; return s - Math.floor(s); };
+
+// ---------------------------------------------------------------- tuning
+// Everything a designer would want to turn lives in these four tables.
+const T = {
+  viewMetres: 380,              // metres of sea across the short axis of the screen
+  noGo: 40 * DEG,               // half-angle of the no-go cone; inside it you are in irons
+  ironsAuthority: 0.25,         // fraction of rudder authority kept while in irons
+  fallOff: 0.07,                // rad/s the wind pushes a stalled bow off
+  windPush: 4,                  // m/s of leeway while stalled
+  yawLag: 1.2,                  // seconds for the ship to answer the helm
+  train: 20 * DEG,              // how far gun crews can train a gun off the beam
+  pointBlank: 90,               // metres; inside this, damage x1.25
+  rakeCos: Math.cos(30 * DEG),  // a shot within 30 deg of the target's keel is a rake (x2)
+  strikeHull: 20, strikeCrew: 25, // an enemy strikes its colours at or below these
+  repair: { hull: 25, rig: 30, crew: 15 }, // granted between waves
+  playerSpread: 0.09,           // gunnery scatter, radians (std dev)
+  playerReloadMult: 0.85,       // a drilled crew: the player's guns reload faster than the enemy's
+  enemySpread: 0.16, frigateSpread: 0.14,
+  difficulty: { spread: 0.88, reload: 0.92 }, // multipliers per full loop of the wave list
+};
+const SHOT = [
+  { id: 'round', label: 'Round shot', hull: 4.0, rig: 1.0, crew: 1.0, range: 260 },
+  { id: 'chain', label: 'Chain shot', hull: 0.6, rig: 4.0, crew: 0.6, range: 220 },
+  { id: 'grape', label: 'Grape',      hull: 0.3, rig: 0.6, crew: 3.5, range: 140 },
+];
+const CLASSES = {
+  seventyFour: { label: '74',      len: 56, beam: 15, maxSpeed: 26, turnRate: 0.36, hull: 100, rig: 100, crew: 100, reload: 8,   balls: 12 },
+  frigate:     { label: 'Frigate', len: 46, beam: 12, maxSpeed: 33, turnRate: 0.52, hull: 55,  rig: 80,  crew: 70,  reload: 6.5, balls: 8 },
+  merchant:    { label: 'Prize',   len: 40, beam: 12, maxSpeed: 20, turnRate: 0.30, hull: 60,  rig: 70,  crew: 40,  reload: 12,  balls: 3 },
+};
+const WAVES = [
+  { title: 'Single-ship action', win: 'all',   spawn: [{ cls: 'seventyFour', role: 'warship' }] },
+  { title: 'Convoy',             win: 'prize', spawn: [{ cls: 'merchant', role: 'merchant' }, { cls: 'frigate', role: 'warship' }] },
+  { title: 'Two to one',         win: 'all',   spawn: [{ cls: 'seventyFour', role: 'warship' }, { cls: 'frigate', role: 'warship' }] },
+];
+// speed factor by angle off the wind (0 = head to wind); piecewise linear
+const POS = [[T.noGo, 0.5], [90 * DEG, 1.0], [135 * DEG, 0.95], [180 * DEG, 0.7]];
+function sailFactor(a) {
+  if (a < T.noGo) return 0.03;
+  for (let i = 0; i < POS.length - 1; i++) {
+    const [a0, f0] = POS[i], [a1, f1] = POS[i + 1];
+    if (a <= a1) return f0 + (f1 - f0) * (a - a0) / (a1 - a0);
+  }
+  return 0.7;
+}
+const posName = a => a < T.noGo ? 'In irons' : a < 62 * DEG ? 'Close-hauled' : a < 112 * DEG ? 'Reaching' : a < 158 * DEG ? 'Broad reach' : 'Running';
+
+// ---------------------------------------------------------------- canvas
+const canvas = document.getElementById('sea');
+const ctx = canvas.getContext('2d');
+let W = 1, H = 1, DPR = 1, PPM = 1, helmH = 90;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.max(1, window.innerWidth); H = Math.max(1, window.innerHeight);
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  PPM = Math.min(W, H) / T.viewMetres;
+  helmH = clamp(H * 0.13, 76, 110);
+}
+window.addEventListener('resize', resize); resize();
+
+// ---------------------------------------------------------------- state
+const wind = { from: 0, veer: 0 };
+const cam = { x: 0, y: 0 };
+let ships = [], player = null;
+const smokes = [], tracers = [], splashes = [], flashes = [], sparks = [];
+const game = { mode: 'title', time: 0, waveIndex: -1, waveDef: null, waveTime: 0, score: 0, clearT: 0, overT: 0, overText: '', banners: [] };
+
+function makeShip(clsKey, side, x, y, heading) {
+  const c = CLASSES[clsKey];
+  return {
+    cls: c, clsKey, side, x, y, heading, speed: 0, yaw: 0, rudder: 0, sail: 1,
+    hull: c.hull, rig: c.rig, crew: c.crew,
+    reload: [0, 0], reloadMax: [1, 1], railFlash: [0, 0], shot: 0,
+    spread: T.playerSpread, reloadMult: 1,
+    struck: false, sunk: false, sinkT: 0, hitFlash: 0, irons: false, ai: null,
+  };
+}
+function banner(text, color, life) { life = life || 1.6; game.banners.push({ text, color, life, max: life }); if (game.banners.length > 3) game.banners.shift(); }
+
+function initTitle() {
+  wind.from = rand(-Math.PI, Math.PI); wind.veer = 0;
+  player = makeShip('seventyFour', 'player', 0, 0, wrap(wind.from + (Math.random() < 0.5 ? 1 : -1) * 135 * DEG));
+  player.speed = 12; ships = [player]; cam.x = 0; cam.y = 0;
+}
+function startGame() {
+  game.score = 0; game.waveIndex = -1; game.banners.length = 0;
+  smokes.length = tracers.length = splashes.length = flashes.length = sparks.length = 0;
+  player = makeShip('seventyFour', 'player', 0, 0, -Math.PI / 2);
+  player.reloadMult = T.playerReloadMult;
+  ships = [player];
+  nextWave();
+}
+function nextWave() {
+  ships = ships.filter(s => s.side === 'player');
+  game.waveIndex++;
+  const def = WAVES[game.waveIndex % WAVES.length];
+  game.waveDef = def; game.waveTime = 0; game.mode = 'play';
+  const loop = Math.floor(game.waveIndex / WAVES.length);
+  wind.from = rand(-Math.PI, Math.PI); wind.veer = rand(-1, 1) * 0.004;
+  if (game.waveIndex > 0) {
+    player.hull = Math.min(player.cls.hull, player.hull + T.repair.hull);
+    player.rig = Math.min(player.cls.rig, player.rig + T.repair.rig);
+    player.crew = Math.min(player.cls.crew, player.crew + T.repair.crew);
+  }
+  player.reload = [0, 0]; player.rudder = 0; player.yaw = 0; player.sail = 1; player.struck = false;
+  player.speed = Math.max(player.speed, 8);
+  def.spawn.forEach((sp, i) => {
+    let bearing, dist;
+    if (sp.role === 'merchant') { bearing = wind.from + Math.PI + rand(-0.4, 0.4); dist = 330; }
+    else { bearing = wind.from + rand(-0.7, 0.7) + (def.spawn.length > 1 ? (i - (def.spawn.length - 1) / 2) * 0.9 : 0); dist = rand(420, 500); }
+    const x = player.x + Math.cos(bearing) * dist, y = player.y + Math.sin(bearing) * dist;
+    const e = makeShip(sp.cls, 'enemy', x, y, sp.role === 'merchant' ? wind.from + Math.PI : Math.atan2(player.y - y, player.x - x));
+    e.spread = (sp.cls === 'frigate' ? T.frigateSpread : T.enemySpread) * Math.pow(T.difficulty.spread, loop);
+    e.reloadMult = Math.pow(T.difficulty.reload, loop);
+    e.speed = e.cls.maxSpeed * 0.5;
+    e.ai = { role: sp.role, t: 0, holdFire: 2.5, arc: 40 * DEG, engage: sp.cls === 'frigate' ? 170 : 200, likesChain: Math.random() < 0.5, escort: def.win === 'prize' && sp.role !== 'merchant' };
+    ships.push(e);
+  });
+  banner(loop ? def.title + ', again' : def.title, '#e9dfc7', 2.6);
+  cam.x = player.x; cam.y = player.y;
+}
+function gameOver(text) { game.mode = 'gameover'; game.overT = 0; game.overText = text; }
+function waveWon() {
+  const foes = ships.filter(s => s.side === 'enemy');
+  if (game.waveDef.win === 'prize') { const pz = foes.find(s => s.ai && s.ai.role === 'merchant'); return !pz || pz.struck || pz.sunk; }
+  return foes.every(s => s.struck || s.sunk);
+}
+
+// ---------------------------------------------------------------- simulation
+function stepShip(s, dt) {
+  if (s.sunk) { s.sinkT += dt; return; }
+  const rel = wrap(s.heading - wind.from), a = Math.abs(rel);
+  const irons = a < T.noGo;
+  const sailMult = [0, 0.6, 1.0][s.sail];
+  const rigMult = 0.2 + 0.8 * (s.rig / s.cls.rig);
+  const target = s.struck ? 0 : s.cls.maxSpeed * sailFactor(a) * sailMult * rigMult;
+  const accel = target > s.speed ? 3.5 : 5.0;
+  s.speed += clamp(target - s.speed, -accel * dt, accel * dt);
+  const steerage = clamp(s.speed / (s.cls.maxSpeed * 0.4), 0, 1);
+  const authority = irons ? Math.max(steerage * T.ironsAuthority, 0.08) : Math.max(steerage, 0.15);
+  const targetYaw = s.cls.turnRate * s.rudder * authority;
+  s.yaw += (targetYaw - s.yaw) * Math.min(1, dt / T.yawLag);
+  s.heading = wrap(s.heading + s.yaw * dt);
+  if (irons && s.speed < s.cls.maxSpeed * 0.15) {
+    // the bow falls off to leeward: toward a held helm if there is one, else the side it already leans
+    const dir = Math.abs(s.rudder) > 0.2 ? Math.sign(s.rudder) : (rel >= 0 ? 1 : -1);
+    s.heading = wrap(s.heading + dir * T.fallOff * dt);
+    s.x += Math.cos(wind.from + Math.PI) * T.windPush * dt;
+    s.y += Math.sin(wind.from + Math.PI) * T.windPush * dt;
+  }
+  s.x += Math.cos(s.heading) * s.speed * dt;
+  s.y += Math.sin(s.heading) * s.speed * dt;
+  for (let i = 0; i < 2; i++) {
+    if (s.reload[i] > 0) s.reload[i] = Math.max(0, s.reload[i] - dt);
+    if (s.railFlash[i] > 0) s.railFlash[i] -= dt;
+  }
+  if (s.hitFlash > 0) s.hitFlash -= dt;
+  s.irons = irons;
+}
+
+function distPointSeg(px, py, ax, ay, bx, by) {
+  const vx = bx - ax, vy = by - ay, wx = px - ax, wy = py - ay, L2 = vx * vx + vy * vy;
+  const t = L2 > 0 ? clamp((wx * vx + wy * vy) / L2, 0, 1) : 0;
+  return Math.hypot(px - (ax + vx * t), py - (ay + vy * t));
+}
+// distance along the ray at which it enters the target's hull (a capsule), or null
+function rayCapsule(ox, oy, dx, dy, t, range) {
+  const hx = Math.cos(t.heading), hy = Math.sin(t.heading), hl = t.cls.len * 0.5, r = t.cls.beam * 0.5 + 0.5;
+  const ax = t.x - hx * hl, ay = t.y - hy * hl, bx = t.x + hx * hl, by = t.y + hy * hl;
+  for (let d = 4; d <= range; d += 3) {
+    if (distPointSeg(ox + dx * d, oy + dy * d, ax, ay, bx, by) <= r) return d;
+  }
+  return null;
+}
+function applyHit(shooter, t, shot, dx, dy, dist) {
+  const hx = Math.cos(t.heading), hy = Math.sin(t.heading);
+  const rake = Math.abs(dx * hx + dy * hy) > T.rakeCos;
+  let m = (dist < T.pointBlank ? 1.25 : 1) * (rake ? 2 : 1);
+  if (shot.id === 'grape' && dist > 70) m *= 0.4;
+  t.hull = Math.max(0, t.hull - shot.hull * m);
+  t.rig = Math.max(0, t.rig - shot.rig * m);
+  t.crew = Math.max(0, t.crew - shot.crew * m);
+  t.hitFlash = 0.15;
+  if (shooter.side === 'player' && !t.struck) game.score += Math.round(10 * m);
+  if (t.hull <= 0 && !t.sunk) sink(t);
+  else if (t.side === 'enemy' && !t.struck && (t.hull <= T.strikeHull || t.crew <= T.strikeCrew)) strike(t);
+  return rake;
+}
+function strike(t) {
+  t.struck = true; t.sail = 0; t.rudder = 0;
+  if (t.side !== 'enemy') return;
+  const prize = t.ai && t.ai.role === 'merchant';
+  let bonus = 500 + Math.max(0, Math.round((240 - game.waveTime) * 2));
+  if (prize) bonus += Math.round(800 * t.hull / t.cls.hull);
+  game.score += bonus;
+  banner((prize ? 'Prize struck' : 'Enemy struck') + '  +' + bonus, '#c9a24a', 2.2);
+}
+function sink(t) {
+  t.sunk = true; t.sinkT = 0; t.speed = 0;
+  if (t.side !== 'enemy') return;
+  const prize = t.ai && t.ai.role === 'merchant';
+  game.score += 300;
+  banner((prize ? 'Prize sunk' : 'Enemy sunk') + '  +300', '#e9dfc7', 2.2);
+}
+function fire(s, side) { // side 0 = port, 1 = starboard
+  if (s.reload[side] > 0 || s.sunk || s.struck) return false;
+  const crewFrac = s.crew / s.cls.crew;
+  s.reloadMax[side] = s.cls.reload * (1 + (1 - crewFrac) * 1.5) * s.reloadMult;
+  s.reload[side] = s.reloadMax[side];
+  const shot = SHOT[s.shot];
+  const hx = Math.cos(s.heading), hy = Math.sin(s.heading);
+  const sg = side === 1 ? 1 : -1;
+  const px = -hy * sg, py = hx * sg; // outward normal of the firing side
+  const base = Math.atan2(py, px);
+  const enemies = ships.filter(o => o !== s && !o.sunk && o.side !== s.side);
+  const trainable = enemies.filter(o => !o.struck);
+  let raked = false, hits = 0;
+  const n = s.cls.balls;
+  for (let i = 0; i < n; i++) {
+    const along = (n === 1 ? 0 : (i / (n - 1) - 0.5)) * s.cls.len * 0.7;
+    const ox = s.x + hx * along + px * s.cls.beam * 0.5, oy = s.y + hy * along + py * s.cls.beam * 0.5;
+    let ang = base, bestOff = T.train;
+    for (const t of trainable) {
+      const tb = Math.atan2(t.y - oy, t.x - ox), off = Math.abs(wrap(tb - base));
+      if (off < bestOff && Math.hypot(t.x - ox, t.y - oy) < shot.range * 1.1) { bestOff = off; ang = tb; }
+    }
+    ang += gauss() * s.spread;
+    const dx = Math.cos(ang), dy = Math.sin(ang);
+    let hit = null, hd = shot.range;
+    for (const t of enemies) { const d = rayCapsule(ox, oy, dx, dy, t, shot.range); if (d !== null && d < hd) { hd = d; hit = t; } }
+    tracers.push({ x1: ox, y1: oy, x2: ox + dx * hd, y2: oy + dy * hd, life: 0.14, max: 0.14 });
+    smokes.push({ x: ox + dx * 3, y: oy + dy * 3, r: 3, life: 2.2, max: 2.2,
+      vx: Math.cos(wind.from + Math.PI) * 5 + dx * 4, vy: Math.sin(wind.from + Math.PI) * 5 + dy * 4 });
+    flashes.push({ x: ox, y: oy, life: 0.08, max: 0.08 });
+    if (hit) { if (applyHit(s, hit, shot, dx, dy, hd)) raked = true; hits++; sparks.push({ x: ox + dx * hd, y: oy + dy * hd, life: 0.35, max: 0.35 }); }
+    else splashes.push({ x: ox + dx * hd, y: oy + dy * hd, life: 0.7, max: 0.7 });
+  }
+  if (s.side === 'player' && raked) { game.score += 100; banner('Rake  +100', '#c9a24a'); }
+  boom(s === player ? 1 : clamp(1 - Math.hypot(s.x - player.x, s.y - player.y) / 700, 0.15, 0.7), hits > 0);
+  return true;
+}
+
+function avoidIrons(h) {
+  const rel = wrap(h - wind.from), lim = T.noGo + 0.12;
+  return Math.abs(rel) < lim ? wrap(wind.from + (rel >= 0 ? 1 : -1) * lim) : h;
+}
+function stepAI(s, dt) {
+  const ai = s.ai; if (!ai || s.struck || s.sunk) return;
+  let p = null, pd = Infinity;
+  for (const o of ships) { if (o.side === s.side || o.sunk || o.struck) continue; const d = Math.hypot(o.x - s.x, o.y - s.y); if (d < pd) { pd = d; p = o; } }
+  if (!p) return;
+  const dx = p.x - s.x, dy = p.y - s.y, range = Math.hypot(dx, dy) || 1, bearing = Math.atan2(dy, dx);
+  const hx = Math.cos(s.heading), hy = Math.sin(s.heading);
+  const downwind = wind.from + Math.PI;
+  let desired, sail = 1;
+  if (ai.role === 'merchant') {
+    // a merchant crew runs dead downwind, not on the fastest point of sail; alone under a 74's guns, she strikes
+    const escorted = ships.some(o => o.side === s.side && o !== s && !o.struck && !o.sunk && o.ai && o.ai.role !== 'merchant');
+    if (!escorted && range < 220 && !p.sunk) { strike(s); return; }
+    const c1 = downwind - 0.25, c2 = downwind + 0.25, away = Math.atan2(-dy, -dx);
+    desired = Math.abs(wrap(c1 - away)) < Math.abs(wrap(c2 - away)) ? c1 : c2;
+    sail = escorted ? 2 : 0; // with the escort beaten she heaves to and waits for the boat
+  } else if (range > ai.engage * 1.4) {
+    // approach: an escort puts herself between the prize and the enemy; anyone else takes the weather gauge
+    const prize = ai.escort ? ships.find(o => o.side === s.side && o.ai && o.ai.role === 'merchant' && !o.struck && !o.sunk) : null;
+    let gx, gy;
+    if (prize) { const ex = p.x - prize.x, ey = p.y - prize.y, el = Math.hypot(ex, ey) || 1; gx = prize.x + ex / el * 120; gy = prize.y + ey / el * 120; }
+    else { gx = p.x + Math.cos(wind.from) * 140; gy = p.y + Math.sin(wind.from) * 140; }
+    desired = Math.atan2(gy - s.y, gx - s.x); sail = 2;
+  } else {
+    // engage: hold a broadside on the player, working toward the stern, on a good point of sail
+    const ppx = Math.cos(p.heading), ppy = Math.sin(p.heading);
+    const cands = [bearing + Math.PI / 2, bearing - Math.PI / 2];
+    let best = cands[0], bs = -1e9;
+    for (const c of cands) {
+      const cx = Math.cos(c), cy = Math.sin(c);
+      const towardStern = -(cx * ppx + cy * ppy);
+      const pos = sailFactor(Math.abs(wrap(c - wind.from)));
+      const cont = Math.cos(wrap(c - s.heading));
+      const sc = towardStern * (p.speed < 5 ? 1.6 : 0.9) + pos * 1.4 + cont * 0.8;
+      if (sc > bs) { bs = sc; best = c; }
+    }
+    desired = best;
+    if (range > ai.engage) desired = wrap(desired + wrap(bearing - desired) * 0.35);
+    else if (range < 70) desired = wrap(desired - wrap(bearing - desired) * 0.35);
+    sail = range > ai.engage * 1.1 ? 2 : 1;
+  }
+  for (const o of ships) {
+    if (o === s || o.sunk) continue;
+    const ox = o.x - s.x, oy = o.y - s.y, d = Math.hypot(ox, oy), min = (s.cls.len + o.cls.len) * 0.55;
+    if (d < min && d > 0) desired = wrap(desired + wrap(Math.atan2(-oy, -ox) - desired) * (1 - d / min) * 0.9);
+  }
+  desired = avoidIrons(desired);
+  const err = wrap(desired - s.heading), toWind = wrap(wind.from - s.heading);
+  if (s.irons && s.speed < s.cls.maxSpeed * 0.3) {
+    s.rudder = toWind >= 0 ? -1 : 1;                       // caught: fall off, whichever side is nearer
+  } else if (Math.sign(toWind) === Math.sign(err) && Math.abs(toWind) < Math.abs(err)) {
+    s.rudder = err > 0 ? -1 : 1;                           // the short turn crosses the wind: wear instead
+  } else {
+    s.rudder = clamp(err * 1.8, -1, 1);
+  }
+  s.sail = sail;
+  if (ai.role !== 'merchant') {
+    if (range < 90 && p.crew > 40) s.shot = 2;
+    else if (range > 150 && p.rig > 50 && ai.likesChain) s.shot = 1;
+    else s.shot = 0;
+  }
+  const shot = SHOT[s.shot];
+  if (range < shot.range && ai.t > ai.holdFire) {
+    const dot = (dx * -hy + dy * hx) / range; // projection on the starboard normal
+    if (Math.abs(dot) > Math.cos(ai.arc)) { const side = dot > 0 ? 1 : 0; if (s.reload[side] <= 0) fire(s, side); }
+  }
+  ai.t += dt;
+}
+function separate() {
+  for (let i = 0; i < ships.length; i++) for (let j = i + 1; j < ships.length; j++) {
+    const a = ships[i], b = ships[j]; if (a.sunk || b.sunk) continue;
+    const dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy) || 0.01, min = (a.cls.len + b.cls.len) * 0.28;
+    if (d < min) {
+      const push = (min - d) * 0.5, ux = dx / d, uy = dy / d;
+      a.x -= ux * push; a.y -= uy * push; b.x += ux * push; b.y += uy * push;
+      a.speed *= 0.97; b.speed *= 0.97;
+    }
+  }
+}
+function tick(arr, dt) { for (let i = arr.length - 1; i >= 0; i--) { arr[i].life -= dt; if (arr[i].life <= 0) arr.splice(i, 1); } }
+function updateEffects(dt) {
+  for (let i = smokes.length - 1; i >= 0; i--) {
+    const s = smokes[i]; s.life -= dt; s.x += s.vx * dt; s.y += s.vy * dt; s.r += 5 * dt; s.vx *= 0.98; s.vy *= 0.98;
+    if (s.life <= 0) smokes.splice(i, 1);
+  }
+  tick(tracers, dt); tick(splashes, dt); tick(flashes, dt); tick(sparks, dt);
+  for (const s of ships) {
+    if (!s.sunk && s.hull < 40 && Math.random() < dt * (2 - (s.hull / 40) * 1.5)) {
+      smokes.push({ x: s.x + rand(-8, 8), y: s.y + rand(-8, 8), r: 2, life: 2.5, max: 2.5, dark: true,
+        vx: Math.cos(wind.from + Math.PI) * 5, vy: Math.sin(wind.from + Math.PI) * 5 });
+    }
+  }
+  if (smokes.length > 320) smokes.splice(0, smokes.length - 320);
+}
+function updateCamera(dt) {
+  let tx = player.x, ty = player.y;
+  const foes = ships.filter(s => s.side === 'enemy' && !s.sunk && !s.struck);
+  if (foes.length) {
+    let n = foes[0], nd = Infinity;
+    for (const f of foes) { const d = Math.hypot(f.x - player.x, f.y - player.y); if (d < nd) { nd = d; n = f; } }
+    const ox = n.x - player.x, oy = n.y - player.y, d = Math.hypot(ox, oy) || 1, lead = Math.min(d * 0.35, 120);
+    tx += ox / d * lead; ty += oy / d * lead;
+  }
+  const k = 1 - Math.pow(0.02, dt);
+  cam.x = lerp(cam.x, tx, k); cam.y = lerp(cam.y, ty, k);
+}
+function update(dt) {
+  game.time += dt;
+  for (let i = game.banners.length - 1; i >= 0; i--) { game.banners[i].life -= dt; if (game.banners[i].life <= 0) game.banners.splice(i, 1); }
+  wind.from = wrap(wind.from + wind.veer * dt);
+  for (const s of ships) { if (s.side === 'enemy' && game.mode !== 'gameover') stepAI(s, dt); stepShip(s, dt); }
+  separate();
+  ships = ships.filter(s => !(s.sunk && s.sinkT > 4 && s.side !== 'player'));
+  updateEffects(dt);
+  updateCamera(dt);
+  if (game.mode === 'title') return;
+  if (game.mode === 'gameover') { game.overT += dt; return; }
+  game.waveTime += dt;
+  if (game.mode === 'play') {
+    if (player.sunk && player.sinkT > 2.5) gameOver('Your ship has gone down.');
+    else if (!player.sunk && player.crew <= 0) { player.struck = true; player.sail = 0; gameOver('Too few hands left to fight. You strike your colours.'); }
+    else if (waveWon()) { game.mode = 'cleared'; game.clearT = 0; }
+  } else if (game.mode === 'cleared') {
+    game.clearT += dt; if (game.clearT > 3.2) nextWave();
+  }
+}
+
+// ---------------------------------------------------------------- audio
+let AC = null;
+function ensureAudio() {
+  if (AC) { if (AC.state === 'suspended') AC.resume(); return; }
+  try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; }
+}
+function boom(gain, hit) {
+  if (!AC) return;
+  try {
+    const t = AC.currentTime, len = 0.5;
+    const buf = AC.createBuffer(1, Math.floor(AC.sampleRate * len), AC.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / d.length, 3);
+    const src = AC.createBufferSource(); src.buffer = buf;
+    const f = AC.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = hit ? 900 : 500;
+    const g = AC.createGain(); g.gain.value = 0.45 * gain;
+    src.connect(f); f.connect(g); g.connect(AC.destination); src.start(t);
+    const o = AC.createOscillator(); o.type = 'sine';
+    o.frequency.setValueAtTime(70, t); o.frequency.exponentialRampToValueAtTime(30, t + 0.4);
+    const og = AC.createGain(); og.gain.setValueAtTime(0.5 * gain, t); og.gain.exponentialRampToValueAtTime(0.001, t + 0.45);
+    o.connect(og); og.connect(AC.destination); o.start(t); o.stop(t + 0.5);
+  } catch (e) { /* audio is optional */ }
+}
+
+// ---------------------------------------------------------------- input
+let uiRects = [];
+const active = new Map();
+function setRudderFromX(x) { const half = Math.min(W * 0.36, 160); player.rudder = clamp((x - W / 2) / half, -1, 1); }
+function setSail(v) { player.sail = clamp(v, 0, 2); }
+function tapSea(x, y) {
+  for (const r of uiRects) if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) { r.onTap(); return; }
+  if (game.mode !== 'play' && game.mode !== 'cleared') return;
+  const wx = cam.x + (x - W / 2) / PPM, wy = cam.y + (y - H / 2) / PPM;
+  const nx = -Math.sin(player.heading), ny = Math.cos(player.heading); // starboard normal
+  const side = ((wx - player.x) * nx + (wy - player.y) * ny) > 0 ? 1 : 0;
+  if (!fire(player, side)) player.railFlash[side] = 0.35;
+}
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault(); ensureAudio();
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* not required */ }
+  const x = e.clientX, y = e.clientY;
+  if (game.mode === 'title') { startGame(); return; }
+  if (game.mode === 'gameover') { if (game.overT > 1) startGame(); return; }
+  if (y > H - helmH) { active.set(e.pointerId, { kind: 'helm' }); setRudderFromX(x); return; }
+  active.set(e.pointerId, { kind: 'sea', x0: x, y0: y, t0: performance.now(), done: false, moved: false });
+});
+canvas.addEventListener('pointermove', e => {
+  const a = active.get(e.pointerId); if (!a) return;
+  if (a.kind === 'helm') { setRudderFromX(e.clientX); return; }
+  if (a.done) return;
+  const dx = e.clientX - a.x0, dy = e.clientY - a.y0;
+  if (Math.abs(dy) > 36 && Math.abs(dy) > Math.abs(dx) * 1.3) { a.done = true; setSail(player.sail + (dy < 0 ? 1 : -1)); }
+  else if (Math.hypot(dx, dy) > 14) a.moved = true;
+});
+const endPointer = e => {
+  const a = active.get(e.pointerId); if (!a) return;
+  active.delete(e.pointerId);
+  if (a.kind === 'sea' && !a.done && !a.moved && performance.now() - a.t0 < 450) tapSea(a.x0, a.y0);
+};
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', endPointer);
+canvas.addEventListener('touchstart', e => e.preventDefault(), { passive: false });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// ---------------------------------------------------------------- rendering
+const HUD = {
+  fg: '#e9dfc7', dim: 'rgba(233,223,199,0.55)', brass: '#c9a24a', red: '#c8443a', tar: 'rgba(20,17,14,0.55)',
+  font: (w, s) => `${w} ${s}px Georgia, "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif`,
+};
+const COL = {
+  player:   { hull: '#b58a3a', band: '#1b1814', deck: '#d2b67c', sail: 'rgba(240,232,214,0.92)', flag: '#2f4a8a' },
+  enemy:    { hull: '#6a4a33', band: '#8f2c22', deck: '#a88a62', sail: 'rgba(226,218,200,0.9)',  flag: '#b8382e' },
+  merchant: { hull: '#7a6a50', band: '#2a2620', deck: '#b8a888', sail: 'rgba(226,218,200,0.9)',  flag: '#b8382e' },
+};
+const w2s = (x, y) => [W / 2 + (x - cam.x) * PPM, H / 2 + (y - cam.y) * PPM];
+
+function drawSea() {
+  const g = ctx.createLinearGradient(0, 0, 0, H); g.addColorStop(0, '#123f4a'); g.addColorStop(1, '#0a2733');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  // crests lie across the wind and travel downwind, anchored in world space
+  const R = Math.hypot(W, H) * 0.5 + 40, spacing = 42, wf = wind.from;
+  const phase = (game.time * 7) % spacing;
+  const proj = cam.x * Math.cos(wf) + cam.y * Math.sin(wf);
+  ctx.save(); ctx.translate(W / 2, H / 2); ctx.rotate(wf);
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)'; ctx.lineWidth = 1;
+  const kMin = Math.ceil((proj - R / PPM + phase) / spacing), kMax = Math.floor((proj + R / PPM + phase) / spacing);
+  ctx.beginPath();
+  for (let k = kMin; k <= kMax; k++) {
+    const x = (k * spacing - phase - proj) * PPM;
+    ctx.moveTo(x + Math.sin(k * 1.7) * 3, -R);
+    for (let y = -R + 40; y <= R; y += 40) ctx.lineTo(x + Math.sin(y * 0.03 + k * 1.7 + game.time * 0.6) * 4, y);
+  }
+  ctx.stroke();
+  ctx.restore();
+  const cell = 46, x0 = cam.x - W / (2 * PPM), y0 = cam.y - H / (2 * PPM), x1 = cam.x + W / (2 * PPM), y1 = cam.y + H / (2 * PPM);
+  ctx.fillStyle = 'rgba(255,255,255,0.10)';
+  for (let i = Math.floor(x0 / cell); i <= Math.floor(x1 / cell); i++) for (let j = Math.floor(y0 / cell); j <= Math.floor(y1 / cell); j++) {
+    const h1 = hash(i, j); if (h1 > 0.42) continue;
+    const h2 = hash(j, i);
+    const [sx, sy] = w2s((i + h1 / 0.42) * cell, (j + h2) * cell);
+    ctx.beginPath(); ctx.ellipse(sx, sy, (3 + h2 * 5) * PPM, 1.2 * PPM, wf + Math.PI / 2, 0, TAU); ctx.fill();
+  }
+}
+function drawNoGo() {
+  if (player.sunk) return;
+  const [sx, sy] = w2s(player.x, player.y), r = 70 * PPM;
+  ctx.save(); ctx.translate(sx, sy);
+  ctx.beginPath(); ctx.moveTo(0, 0); ctx.arc(0, 0, r, wind.from - T.noGo, wind.from + T.noGo); ctx.closePath();
+  ctx.fillStyle = player.irons ? 'rgba(200,68,58,0.22)' : 'rgba(200,68,58,0.08)'; ctx.fill();
+  ctx.restore();
+}
+function drawRig(s, L, B, col, lw) {
+  const masts = [[L * 0.24, B * 1.5], [0, B * 1.75], [-L * 0.27, B * 1.3]];
+  let ya = wrap(wind.from + Math.PI / 2 - s.heading); if (ya < 0) ya += Math.PI;
+  ya = clamp(ya, Math.PI / 2 - 40 * DEG, Math.PI / 2 + 40 * DEG);
+  const ex = Math.cos(ya), ey = Math.sin(ya);
+  const dwl = wrap(wind.from + Math.PI - s.heading), bx = Math.cos(dwl), by = Math.sin(dwl);
+  const rigFrac = s.rig / s.cls.rig, sailOn = s.sail > 0 && !s.struck;
+  for (let i = 0; i < masts.length; i++) {
+    const [mx, yl] = masts[i], half = yl * 0.5;
+    const hasSail = sailOn && (i === 1 || (i === 0 && rigFrac > 0.25) || (i === 2 && rigFrac > 0.5));
+    if (hasSail) {
+      const belly = B * (s.sail === 2 ? 0.55 : 0.32);
+      ctx.fillStyle = col.sail; ctx.beginPath();
+      ctx.moveTo(mx - ex * half, -ey * half);
+      ctx.quadraticCurveTo(mx + bx * belly * 2, by * belly * 2, mx + ex * half, ey * half);
+      ctx.closePath(); ctx.fill();
+      ctx.strokeStyle = 'rgba(60,50,40,0.5)'; ctx.lineWidth = 0.8 * lw; ctx.stroke();
+    }
+    ctx.strokeStyle = '#2a2018'; ctx.lineWidth = 1.6 * lw;
+    ctx.beginPath(); ctx.moveTo(mx - ex * half, -ey * half); ctx.lineTo(mx + ex * half, ey * half); ctx.stroke();
+    ctx.fillStyle = '#3a2c1e'; ctx.beginPath(); ctx.arc(mx, 0, 1.6, 0, TAU); ctx.fill();
+  }
+}
+function drawShip(s) {
+  const [sx, sy] = w2s(s.x, s.y);
+  if (sx < -140 || sy < -140 || sx > W + 140 || sy > H + 140) return;
+  const L = s.cls.len, B = s.cls.beam;
+  const col = s.side === 'player' ? COL.player : (s.ai && s.ai.role === 'merchant' ? COL.merchant : COL.enemy);
+  let alpha = 1, scale = PPM;
+  if (s.sunk) { const t = clamp(s.sinkT / 3.5, 0, 1); alpha = 1 - t; scale = PPM * (1 - 0.35 * t); }
+  ctx.save(); ctx.translate(sx, sy); ctx.rotate(s.heading); ctx.scale(scale, scale); ctx.globalAlpha = alpha;
+  const lw = 1 / scale;
+  if (!s.sunk && s.speed > 2) {
+    const f = s.speed / s.cls.maxSpeed;
+    ctx.strokeStyle = `rgba(255,255,255,${0.18 * f})`; ctx.lineWidth = 2 * lw;
+    ctx.beginPath();
+    ctx.moveTo(-L * 0.45, -B * 0.35); ctx.lineTo(-L * 0.45 - 40 * f, -B * 0.35 - 12 * f);
+    ctx.moveTo(-L * 0.45, B * 0.35); ctx.lineTo(-L * 0.45 - 40 * f, B * 0.35 + 12 * f);
+    ctx.stroke();
+    ctx.fillStyle = `rgba(255,255,255,${0.25 * f})`; ctx.beginPath(); ctx.ellipse(L * 0.42, 0, 5, B * 0.55, 0, 0, TAU); ctx.fill();
+  }
+  // hull
+  ctx.beginPath(); ctx.moveTo(L * 0.5, 0);
+  ctx.quadraticCurveTo(L * 0.28, -B * 0.5, -L * 0.3, -B * 0.5); ctx.lineTo(-L * 0.47, -B * 0.42);
+  ctx.quadraticCurveTo(-L * 0.53, 0, -L * 0.47, B * 0.42); ctx.lineTo(-L * 0.3, B * 0.5);
+  ctx.quadraticCurveTo(L * 0.28, B * 0.5, L * 0.5, 0); ctx.closePath();
+  ctx.fillStyle = s.hitFlash > 0 ? '#f2e2b0' : col.hull; ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 1.2 * lw; ctx.stroke();
+  // gunport bands
+  ctx.strokeStyle = col.band; ctx.lineWidth = B * 0.14;
+  ctx.beginPath(); ctx.moveTo(-L * 0.36, -B * 0.36); ctx.lineTo(L * 0.3, -B * 0.36);
+  ctx.moveTo(-L * 0.36, B * 0.36); ctx.lineTo(L * 0.3, B * 0.36); ctx.stroke();
+  // deck
+  ctx.fillStyle = col.deck; ctx.beginPath(); ctx.moveTo(L * 0.4, 0);
+  ctx.quadraticCurveTo(L * 0.22, -B * 0.24, -L * 0.28, -B * 0.24); ctx.lineTo(-L * 0.42, -B * 0.2); ctx.lineTo(-L * 0.42, B * 0.2);
+  ctx.lineTo(-L * 0.28, B * 0.24); ctx.quadraticCurveTo(L * 0.22, B * 0.24, L * 0.4, 0); ctx.closePath(); ctx.fill();
+  // bowsprit and ensign
+  ctx.strokeStyle = '#2a2018'; ctx.lineWidth = 1.2 * lw; ctx.beginPath(); ctx.moveTo(L * 0.48, 0); ctx.lineTo(L * 0.68, 0); ctx.stroke();
+  ctx.fillStyle = s.struck ? '#f4f0e6' : col.flag; ctx.fillRect(-L * 0.55, -2, -7, 4);
+  drawRig(s, L, B, col, lw);
+  // the batteries: a rail along each side fills as the guns reload and glows brass when ready
+  if (s.side === 'player' && !s.sunk) {
+    for (let side = 0; side < 2; side++) {
+      const y = (side ? 1 : -1) * (B * 0.5 + 3);
+      const frac = s.reload[side] <= 0 ? 1 : 1 - s.reload[side] / s.reloadMax[side];
+      ctx.lineWidth = 2.2 * lw; ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+      ctx.beginPath(); ctx.moveTo(-L * 0.36, y); ctx.lineTo(L * 0.3, y); ctx.stroke();
+      ctx.strokeStyle = s.railFlash[side] > 0 ? HUD.red : (frac >= 1 ? HUD.brass : '#9fb7c9');
+      ctx.beginPath(); ctx.moveTo(-L * 0.36, y); ctx.lineTo(-L * 0.36 + (L * 0.66) * frac, y); ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+function drawEnemyTags(s) {
+  if (s.side !== 'enemy' || s.sunk) return;
+  const [sx, sy] = w2s(s.x, s.y);
+  if (sx < -60 || sx > W + 60 || sy < -60 || sy > H + 60) return;
+  const y = sy - s.cls.len * 0.55 * PPM - 26, w = 40, x = sx - w / 2;
+  const rows = [[s.hull / s.cls.hull, '#d0563f'], [s.rig / s.cls.rig, '#e9dfc7'], [s.crew / s.cls.crew, '#7fb0d8']];
+  rows.forEach((r, i) => {
+    ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.fillRect(x, y + i * 5, w, 3);
+    ctx.fillStyle = r[1]; ctx.fillRect(x, y + i * 5, w * clamp(r[0], 0, 1), 3);
+  });
+  ctx.fillStyle = s.struck ? HUD.fg : HUD.dim; ctx.font = HUD.font(400, 11); ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText(s.struck ? 'Struck' : s.cls.label, sx, y - 4);
+}
+function drawEffects() {
+  for (const s of smokes) {
+    const [x, y] = w2s(s.x, s.y), a = clamp(s.life / s.max, 0, 1);
+    ctx.fillStyle = s.dark ? `rgba(40,36,32,${0.45 * a})` : `rgba(235,235,230,${0.55 * a})`;
+    ctx.beginPath(); ctx.arc(x, y, s.r * PPM, 0, TAU); ctx.fill();
+  }
+  ctx.lineWidth = 1.2;
+  for (const t of tracers) {
+    const a = t.life / t.max, [x1, y1] = w2s(t.x1, t.y1), [x2, y2] = w2s(t.x2, t.y2);
+    ctx.strokeStyle = `rgba(255,230,170,${0.8 * a})`; ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+  }
+  for (const f of flashes) { const [x, y] = w2s(f.x, f.y); ctx.fillStyle = 'rgba(255,190,90,0.9)'; ctx.beginPath(); ctx.arc(x, y, 3.5 * PPM, 0, TAU); ctx.fill(); }
+  for (const p of splashes) {
+    const [x, y] = w2s(p.x, p.y), t = 1 - p.life / p.max;
+    ctx.strokeStyle = `rgba(255,255,255,${0.6 * (1 - t)})`; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x, y, (2 + 7 * t) * PPM, 0, TAU); ctx.stroke();
+  }
+  for (const p of sparks) {
+    const [x, y] = w2s(p.x, p.y), a = p.life / p.max;
+    ctx.fillStyle = `rgba(255,140,60,${a})`; ctx.beginPath(); ctx.arc(x, y, 2.5 * PPM * (2 - a), 0, TAU); ctx.fill();
+  }
+}
+function roundRect(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function button(x, y, w, h, label, selected, onTap) {
+  ctx.fillStyle = selected ? 'rgba(201,162,74,0.22)' : HUD.tar; roundRect(x, y, w, h, 4); ctx.fill();
+  ctx.strokeStyle = selected ? HUD.brass : 'rgba(233,223,199,0.35)'; ctx.lineWidth = selected ? 1.5 : 1; roundRect(x, y, w, h, 4); ctx.stroke();
+  ctx.fillStyle = selected ? HUD.fg : HUD.dim; ctx.font = HUD.font(selected ? 700 : 400, 11); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(label, x + w / 2, y + h / 2 + 0.5);
+  uiRects.push({ x: x - 4, y: y - 3, w: w + 8, h: h + 6, onTap });
+}
+function bar(x, y, w, h, frac, color, label) {
+  ctx.fillStyle = HUD.dim; ctx.font = HUD.font(400, 11); ctx.textAlign = 'left'; ctx.textBaseline = 'middle'; ctx.fillText(label, x, y + h / 2);
+  const bx = x + 46, bw = w - 46;
+  ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fillRect(bx, y, bw, h);
+  ctx.fillStyle = frac < 0.3 ? HUD.red : color; ctx.fillRect(bx, y, bw * clamp(frac, 0, 1), h);
+}
+function drawHelm() {
+  const y0 = H - helmH;
+  ctx.fillStyle = HUD.tar; ctx.fillRect(0, y0, W, helmH);
+  const half = Math.min(W * 0.36, 160), ty = y0 + helmH * 0.58;
+  ctx.fillStyle = HUD.dim; ctx.font = HUD.font(400, 11); ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center'; ctx.fillText('Helm', W / 2, y0 + 14);
+  ctx.textAlign = 'right'; ctx.fillText('Port', W / 2 - half - 10, ty);
+  ctx.textAlign = 'left'; ctx.fillText('Starboard', W / 2 + half + 10, ty);
+  ctx.strokeStyle = 'rgba(233,223,199,0.35)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(W / 2 - half, ty); ctx.lineTo(W / 2 + half, ty); ctx.stroke();
+  for (let i = -2; i <= 2; i++) { const x = W / 2 + i * half / 2; ctx.beginPath(); ctx.moveTo(x, ty - (i === 0 ? 9 : 5)); ctx.lineTo(x, ty + (i === 0 ? 9 : 5)); ctx.stroke(); }
+  const kx = W / 2 + player.rudder * half;
+  ctx.strokeStyle = HUD.brass; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(W / 2, ty); ctx.lineTo(kx, ty); ctx.stroke();
+  ctx.fillStyle = '#2a2018'; ctx.beginPath(); ctx.arc(kx, ty, 14, 0, TAU); ctx.fill();
+  ctx.strokeStyle = HUD.brass; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(kx, ty, 14, 0, TAU); ctx.stroke();
+  ctx.fillStyle = HUD.brass; ctx.beginPath(); ctx.arc(kx, ty, 3, 0, TAU); ctx.fill();
+}
+function drawHUD() {
+  uiRects = [];
+  // wind
+  const cx = 36, cy = 40, r = 24;
+  ctx.strokeStyle = HUD.dim; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(cx, cy, r, 0, TAU); ctx.stroke();
+  ctx.fillStyle = HUD.dim; ctx.font = HUD.font(400, 9); ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('N', cx, cy - r + 7);
+  ctx.save(); ctx.translate(cx, cy); ctx.rotate(wind.from + Math.PI);
+  ctx.strokeStyle = HUD.brass; ctx.fillStyle = HUD.brass; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(-r * 0.7, 0); ctx.lineTo(r * 0.5, 0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(r * 0.8, 0); ctx.lineTo(r * 0.42, -5); ctx.lineTo(r * 0.42, 5); ctx.closePath(); ctx.fill();
+  ctx.restore();
+  const a = Math.abs(wrap(player.heading - wind.from));
+  ctx.textAlign = 'left'; ctx.fillStyle = HUD.dim; ctx.font = HUD.font(400, 11); ctx.fillText('Wind', cx + r + 8, cy - 8);
+  ctx.fillStyle = a < T.noGo ? HUD.red : HUD.fg; ctx.font = HUD.font(a < T.noGo ? 700 : 400, 12); ctx.fillText(posName(a), cx + r + 8, cy + 8);
+  // score and wave
+  ctx.textAlign = 'right'; ctx.fillStyle = HUD.fg; ctx.font = HUD.font(700, 20); ctx.fillText(String(game.score), W - 12, 28);
+  ctx.fillStyle = HUD.dim; ctx.font = HUD.font(400, 11); ctx.fillText('Wave ' + (game.waveIndex + 1) + ', ' + game.waveDef.title, W - 12, 48);
+  // sail on the left, shot on the right
+  const bw = 78, bh = 26, by0 = 84;
+  [['Full sail', 2], ['Battle sail', 1], ['Hove to', 0]].forEach((o, i) => button(12, by0 + i * (bh + 8), bw, bh, o[0], player.sail === o[1], () => setSail(o[1])));
+  SHOT.forEach((sh, i) => button(W - 12 - bw, by0 + i * (bh + 8), bw, bh, sh.label, player.shot === i, () => { player.shot = i; }));
+  // the ship's three lives
+  const barY = H - helmH - 58, barW = W - 24;
+  bar(12, barY, barW, 7, player.hull / player.cls.hull, HUD.brass, 'Hull');
+  bar(12, barY + 16, barW, 7, player.rig / player.cls.rig, HUD.fg, 'Rigging');
+  bar(12, barY + 32, barW, 7, player.crew / player.cls.crew, '#7fb0d8', 'Crew');
+  drawHelm();
+}
+function drawEdgeArrows() {
+  for (const e of ships) {
+    if (e.side !== 'enemy' || e.sunk) continue;
+    const [sx, sy] = w2s(e.x, e.y);
+    if (sx > 20 && sx < W - 20 && sy > 20 && sy < H - 20) continue;
+    const dx = sx - W / 2, dy = sy - H / 2, ang = Math.atan2(dy, dx);
+    const hw = W / 2 - 40, hh = H / 2 - 40;
+    const t = Math.min(hw / Math.max(Math.abs(dx), 1e-6), hh / Math.max(Math.abs(dy), 1e-6));
+    const ax = W / 2 + dx * t, ay = Math.min(H / 2 + dy * t, H - helmH - 78);
+    ctx.save(); ctx.translate(ax, ay); ctx.rotate(ang);
+    ctx.fillStyle = e.struck ? HUD.dim : HUD.brass; ctx.beginPath(); ctx.moveTo(12, 0); ctx.lineTo(-6, -8); ctx.lineTo(-2, 0); ctx.lineTo(-6, 8); ctx.closePath(); ctx.fill();
+    ctx.restore();
+    ctx.fillStyle = HUD.dim; ctx.font = HUD.font(400, 11); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(e.struck ? 'Struck' : e.cls.label, ax - Math.cos(ang) * 22, ay - Math.sin(ang) * 22);
+  }
+}
+function drawBanners() {
+  let y = H * 0.3;
+  for (const b of game.banners) {
+    ctx.globalAlpha = clamp(b.life / 0.5, 0, 1);
+    ctx.fillStyle = b.color; ctx.font = HUD.font(700, 22); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.shadowColor = 'rgba(0,0,0,0.7)'; ctx.shadowBlur = 8; ctx.fillText(b.text, W / 2, y); ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1; y += 30;
+  }
+}
+function wrapLines(text, maxW) {
+  const words = text.split(' '), lines = []; let line = '';
+  for (const w of words) { const t = line ? line + ' ' + w : w; if (ctx.measureText(t).width > maxW && line) { lines.push(line); line = w; } else line = t; }
+  if (line) lines.push(line); return lines;
+}
+function drawTitle() {
+  ctx.fillStyle = 'rgba(6,20,28,0.62)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = HUD.fg; ctx.font = HUD.font(400, Math.min(44, W * 0.11)); ctx.fillText('Weather Gauge', W / 2, H * 0.2);
+  ctx.fillStyle = HUD.dim; ctx.font = HUD.font(400, 14); ctx.fillText('A ship of the line, by touch.', W / 2, H * 0.2 + 34);
+  const lines = [
+    'Drag the helm along the bottom to steer. It holds where you leave it.',
+    'Swipe up or down on the sea to make or take in sail.',
+    'Tap the sea on either side of your ship to fire that broadside.',
+    'The brass arrow is the wind. Sail into it and you stall, in irons, under their guns.',
+    'A ship strikes when its hull or crew is spent. Rake her through bow or stern for double damage.',
+  ];
+  ctx.fillStyle = HUD.fg; ctx.font = HUD.font(400, 14); ctx.textAlign = 'left';
+  const maxW = Math.min(W - 48, 440), x = W / 2 - maxW / 2; let y = H * 0.2 + 84;
+  for (const l of lines) { for (const ll of wrapLines(l, maxW)) { ctx.fillText(ll, x, y); y += 21; } y += 9; }
+  ctx.textAlign = 'center'; ctx.fillStyle = HUD.brass; ctx.font = HUD.font(700, 15);
+  ctx.globalAlpha = 0.7 + 0.3 * Math.sin(game.time * 2.5); ctx.fillText('Tap to begin', W / 2, Math.min(y + 12, H - 40)); ctx.globalAlpha = 1;
+}
+function drawGameOver() {
+  ctx.fillStyle = 'rgba(6,20,28,0.62)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = HUD.fg; ctx.font = HUD.font(400, Math.min(36, W * 0.09)); ctx.fillText(player.sunk ? 'Sunk' : 'Struck', W / 2, H * 0.3);
+  ctx.font = HUD.font(400, 15); const maxW = Math.min(W - 48, 440); let y = H * 0.3 + 40;
+  for (const l of wrapLines(game.overText, maxW)) { ctx.fillText(l, W / 2, y); y += 22; }
+  ctx.fillStyle = HUD.brass; ctx.font = HUD.font(700, 24); ctx.fillText(String(game.score), W / 2, y + 22);
+  ctx.fillStyle = HUD.dim; ctx.font = HUD.font(400, 13); ctx.fillText('Held through ' + game.waveIndex + (game.waveIndex === 1 ? ' action' : ' actions') + ' before this one.', W / 2, y + 50);
+  if (game.overT > 1) { ctx.fillStyle = HUD.brass; ctx.font = HUD.font(700, 15); ctx.fillText('Tap to fight again', W / 2, y + 90); }
+}
+function render() {
+  drawSea();
+  if (game.mode !== 'title') drawNoGo();
+  const order = ships.slice().sort((a, b) => (a.side === 'player') - (b.side === 'player'));
+  for (const s of order) drawShip(s);
+  drawEffects();
+  for (const s of ships) drawEnemyTags(s);
+  if (game.mode === 'title') { drawTitle(); return; }
+  drawHUD(); drawEdgeArrows(); drawBanners();
+  if (game.mode === 'gameover') drawGameOver();
+}
+
+// ---------------------------------------------------------------- loop
+initTitle();
+let last = performance.now(), acc = 0;
+const STEP = 1 / 60;
+function frame(now) {
+  let dt = (now - last) / 1000; last = now;
+  if (dt > 0.1) dt = 0.1;
+  acc += dt;
+  while (acc >= STEP) { update(STEP); acc -= STEP; }
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
