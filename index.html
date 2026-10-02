@@ -510,10 +510,27 @@ function drawSea() {
 }
 function drawNoGo() {
   if (player.sunk) return;
-  const [sx, sy] = w2s(player.x, player.y), r = 70 * PPM;
+  const [sx, sy] = w2s(player.x, player.y), r = 120 * PPM;
+  // how close the bow is to the cone: 0 well clear, 1 at the edge or inside
+  const off = Math.abs(wrap(player.heading - wind.from));
+  const near = player.irons ? 1 : clamp(1 - (off - T.noGo) / (25 * DEG), 0, 1);
+  const pulse = player.irons ? 0.5 + 0.5 * Math.sin(game.time * 6) : 0;
   ctx.save(); ctx.translate(sx, sy);
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, r);
+  const a = 0.14 + 0.14 * near + 0.12 * pulse;
+  g.addColorStop(0, `rgba(200,68,58,${a})`); g.addColorStop(1, `rgba(200,68,58,${a * 0.35})`);
   ctx.beginPath(); ctx.moveTo(0, 0); ctx.arc(0, 0, r, wind.from - T.noGo, wind.from + T.noGo); ctx.closePath();
-  ctx.fillStyle = player.irons ? 'rgba(200,68,58,0.22)' : 'rgba(200,68,58,0.08)'; ctx.fill();
+  ctx.fillStyle = g; ctx.fill();
+  // the two edges of the cone, dashed, brightening as the bow nears them
+  ctx.strokeStyle = `rgba(232,96,84,${0.45 + 0.45 * near})`; ctx.lineWidth = 1.5 + near; ctx.setLineDash([6, 5]);
+  ctx.beginPath();
+  for (const e of [-T.noGo, T.noGo]) { ctx.moveTo(0, 0); ctx.lineTo(Math.cos(wind.from + e) * r, Math.sin(wind.from + e) * r); }
+  ctx.stroke(); ctx.setLineDash([]);
+  ctx.beginPath(); ctx.arc(0, 0, r, wind.from - T.noGo, wind.from + T.noGo); ctx.stroke();
+  if (player.irons) {
+    ctx.fillStyle = `rgba(240,120,108,${0.7 + 0.3 * pulse})`; ctx.font = HUD.font(700, 12); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('IN IRONS', Math.cos(wind.from) * r * 0.72, Math.sin(wind.from) * r * 0.72);
+  }
   ctx.restore();
 }
 function drawRig(s, L, B, col, lw) {
