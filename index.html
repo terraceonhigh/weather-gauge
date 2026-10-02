@@ -35,6 +35,7 @@ const T = {
   fallOff: 0.07,                // rad/s the wind pushes a stalled bow off
   windPush: 4,                  // m/s of leeway while stalled
   yawLag: 1.2,                  // seconds for the ship to answer the helm
+  helmReturn: 1.5,              // rudder units/s the helm eases back to midships once let go; 0 = holds where left
   train: 20 * DEG,              // how far gun crews can train a gun off the beam
   pointBlank: 90,               // metres; inside this, damage x1.25
   rakeCos: Math.cos(30 * DEG),  // a shot within 30 deg of the target's keel is a rake (x2)
@@ -382,6 +383,7 @@ function update(dt) {
   game.time += dt;
   for (let i = game.banners.length - 1; i >= 0; i--) { game.banners[i].life -= dt; if (game.banners[i].life <= 0) game.banners.splice(i, 1); }
   wind.from = wrap(wind.from + wind.veer * dt);
+  centreHelm(dt);
   for (const s of ships) { if (s.side === 'enemy' && game.mode !== 'gameover') stepAI(s, dt); stepShip(s, dt); }
   separate();
   ships = ships.filter(s => !(s.sunk && s.sinkT > 4 && s.side !== 'player'));
@@ -426,6 +428,11 @@ function boom(gain, hit) {
 let uiRects = [];
 const active = new Map();
 function setRudderFromX(x) { const half = Math.min(W * 0.36, 160); player.rudder = clamp((x - W / 2) / half, -1, 1); }
+const helmHeld = () => { for (const a of active.values()) if (a.kind === 'helm') return true; return false; };
+function centreHelm(dt) {
+  if (helmHeld() || !T.helmReturn) return;
+  player.rudder -= Math.sign(player.rudder) * Math.min(Math.abs(player.rudder), T.helmReturn * dt);
+}
 function setSail(v) { player.sail = clamp(v, 0, 2); }
 function tapSea(x, y) {
   for (const r of uiRects) if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) { r.onTap(); return; }
@@ -713,7 +720,7 @@ function drawTitle() {
   ctx.fillStyle = HUD.fg; ctx.font = HUD.font(400, Math.min(44, W * 0.11)); ctx.fillText('Weather Gauge', W / 2, H * 0.2);
   ctx.fillStyle = HUD.dim; ctx.font = HUD.font(400, 14); ctx.fillText('A ship of the line, by touch.', W / 2, H * 0.2 + 34);
   const lines = [
-    'Drag the helm along the bottom to steer. It holds where you leave it.',
+    'Drag the helm along the bottom to steer. Let go and it eases back to midships.',
     'Swipe up or down on the sea to make or take in sail.',
     'Tap the sea on either side of your ship to fire that broadside.',
     'The brass arrow is the wind. Sail into it and you stall, in irons, under their guns.',
